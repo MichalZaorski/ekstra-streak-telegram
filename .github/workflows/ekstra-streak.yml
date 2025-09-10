@@ -3,7 +3,7 @@ name: Ekstraklasa no-draw streak to Telegram
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # co 30 minut (UTC)
+    - cron: "*/50 * * * *"  # uruchom co 50 minut (UTC) — skrypt sam pilnuje, by robić pełny przebieg co >= 100 min
   workflow_dispatch: {}
 
 permissions:
@@ -24,12 +24,14 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run streak checker
+      - name: Run streak checker (interval + only new fixtures)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          THRESHOLD: ${{ secrets.THRESHOLD }}
-          ALERT_MODE: ${{ secrets.ALERT_MODE }}
+          THRESHOLD: ${{ secrets.THRESHOLD }}         # np. 7
+          ALERT_MODE: ${{ secrets.ALERT_MODE }}       # domyślnie EACH
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}  # klucz z API-FOOTBALL (free)
+          RUN_INTERVAL_MIN: "100"                     # minimalny odstęp między pełnymi przebiegami (minuty)
         run: python ekstra_streak_bot.py
 
       - name: Commit state if changed
