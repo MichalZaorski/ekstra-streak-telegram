@@ -3,7 +3,7 @@ name: Ekstraklasa no-draw streak to Telegram
 
 on:
   schedule:
-    - cron: "*/100 * * * *"  # co 30 minut (UTC)
+    - cron: "*/30 * * * *"  # co 30 minut (UTC)
   workflow_dispatch: {}
 
 permissions:
