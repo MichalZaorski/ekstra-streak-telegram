@@ -12,20 +12,20 @@ from datetime import datetime, date
 import requests
 from bs4 import BeautifulSoup
 
-# --- Konfiguracja (z sekretów/zmiennych środowiskowych) ----------------------
+# --- Konfiguracja (z sekretów/zmiennych) -------------------------------------
 THRESHOLD = int(os.getenv("THRESHOLD", "7"))          # domyślnie 7 (>=7)
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
 ALERT_MODE = os.getenv("ALERT_MODE", "EACH").upper()  # EACH | THRESHOLD_ONLY
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")      # <— NOWE (sekret z GitHuba)
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
-# --- 90minut.pl: ID strony sezonu (2025/2026) --------------------------------
-# Sezon 2025/26: http://www.90minut.pl/liga/1/liga14072.html  (możesz nadpisać przez sekret LIGA90_ID)
-LIGA90_ID = os.getenv("LIGA90_ID", "14072")  # zaktualizujesz, gdy zacznie się nowy sezon
+# 90minut: ID strony sezonu 2025/26 (zostawiamy awaryjnie jako last‑resort)
+LIGA90_ID = os.getenv("LIGA90_ID", "14072")  # http://www.90minut.pl/liga/1/liga14072.html  [2](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
 
-# --- Nagłówki HTTP jak w przeglądarce (mniej 403) ----------------------------
+# --- HTTP nagłówki (dla scrape'ów) -------------------------------------------
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -40,28 +40,27 @@ BROWSER_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# --- Pomocnicze --------------------------------------------------------------
 def season_slug(today: date | None = None) -> str:
+    """Zwraca slug sezonu 'YYYY-YYYY' (np. 2025-2026)."""
     today = today or date.today()
     start = today.year if today.month >= 7 else today.year - 1
     return f"{start}-{start+1}"
 
+def season_start_year(today: date | None = None) -> int:
+    """API‑FOOTBALL przyjmuje rok rozpoczęcia sezonu (np. 2025)."""
+    today = today or date.today()
+    return today.year if today.month >= 7 else today.year - 1
+
 def parse_datetime(d_str: str, t_str: str | None) -> datetime | None:
     t_str = t_str or ""
-    candidates = [
-        (f"{d_str} {t_str}", "%d/%m/%Y %H:%M"),
-        (f"{d_str} {t_str}", "%d/%m/%y %H:%M"),
-        (d_str, "%d/%m/%Y"),
-        (d_str, "%d/%m/%y"),
-    ]
-    for s, fmt in candidates:
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%y %H:%M", "%d/%m/%Y", "%d/%m/%y"):
         try:
-            return datetime.strptime(s.strip(), fmt)
+            return datetime.strptime((d_str + " " + t_str).strip(), fmt)
         except Exception:
             continue
     return None
 
-# --- Pobieranie z retry ------------------------------------------------------
+# --- HTTP z retry -------------------------------------------------------------
 def http_get_with_retry(session: requests.Session, url: str, max_tries: int = 5, backoff: float = 2.0) -> requests.Response:
     last_exc: Exception | None = None
     for i in range(max_tries):
@@ -80,21 +79,90 @@ def http_get_with_retry(session: requests.Session, url: str, max_tries: int = 5,
         raise last_exc
     raise RuntimeError(f"Nieudane pobranie: {url}")
 
-# --- Źródła danych (kolejność prób) ------------------------------------------
+# --- API‑FOOTBALL (v3) -------------------------------------------------------
+API_BASE = "https://v3.football.api-sports.io"  # dokumentacja v3  [1](https://www.api-football.com/documentation-v3)
+
+def api_session() -> requests.Session:
+    s = requests.Session()
+    # Dokumentacja: używamy nagłówka x-apisports-key z kluczem.  [1](https://www.api-football.com/documentation-v3)
+    s.headers.update({"x-apisports-key": API_FOOTBALL_KEY})
+    return s
+
+def api_get_league_id_poland_ekstraklasa(session_api: requests.Session) -> int:
+    """
+    Szuka ID ligi „Ekstraklasa” w kraju „Poland”.
+    Buforuje wynik w state.json (state['apifootball_league_id']).
+    """
+    state = load_state()
+    if "apifootball_league_id" in state:
+        return int(state["apifootball_league_id"])
+
+    url = f"{API_BASE}/leagues?country=Poland&name=Ekstraklasa"
+    r = session_api.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    # oczekujemy listy w data['response']; bierzemy pierwszy league.id
+    resp = data.get("response", [])
+    if not resp:
+        raise RuntimeError("API: nie znaleziono ligi 'Ekstraklasa' w Polsce")
+    league_id = int(resp[0]["league"]["id"])
+    # zapisz do state
+    state["apifootball_league_id"] = league_id
+    save_state(state)
+    return league_id
+
+def api_fetch_all_fixtures(session_api: requests.Session, league_id: int, season_year: int) -> list[dict]:
+    """
+    Pobiera WSZYSTKIE zakończone mecze (status=FT) ligi/ sezonu z paginacją:
+    GET /fixtures?league=<id>&season=<year>&status=FT
+    """
+    matches = []
+    page = 1
+    total_pages = 1
+    while page <= total_pages:
+        url = f"{API_BASE}/fixtures?league={league_id}&season={season_year}&status=FT&page={page}"
+        r = session_api.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        paging = data.get("paging", {})
+        total_pages = int(paging.get("total", 1))
+        # parse fixtures
+        for item in data.get("response", []):
+            dt_iso = item["fixture"]["date"]
+            home = item["teams"]["home"]["name"]
+            away = item["teams"]["away"]["name"]
+            hg = item["goals"]["home"]
+            ag = item["goals"]["away"]
+            if hg is None or ag is None:
+                continue
+            matches.append({
+                "dt": dt_iso,
+                "date": dt_iso[:10],
+                "time": dt_iso[11:16],
+                "home": home,
+                "away": away,
+                "home_goals": int(hg),
+                "away_goals": int(ag),
+            })
+        page += 1
+
+    # sort chronologicznie (ISO daty są porównywalne)
+    matches.sort(key=lambda m: m["dt"])
+    return matches
+
+# --- Dotychczasowe fallbacki web (zostawione na wszelki wypadek) -------------
 def candidate_urls_for_season(season: str) -> list[tuple[str, bool, str]]:
     urls: list[tuple[str, bool, str]] = []
-    # 1) 90minut.pl – strona sezonu 2025/26
-    u90 = f"http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html"  # PKO BP Ekstraklasa 2025/2026
-    urls.append((u90, False, "90minut"))                                    # [1](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
+    # 90minut (strona sezonu) + reader
+    u90 = f"http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html"  # 2025/26  [2](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
+    urls.append((u90, False, "90minut"))
     urls.append((f"https://r.jina.ai/http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html", True, "90minut-reader"))
-
-    # 2) worldfootball/weltfussball – fallbacki
-    urls.append((f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/", False, "worldfootball-all"))  # [2](https://www.meczyki.pl/liga/ekstraklasa/119/terminarz)
-    urls.append((f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/", False, "worldfootball-schedule")) # [3](https://www.wyniki.pl/pko-bp-ekstraklasa/mecze/)
-    urls.append((f"https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-{season}/", False, "weltfussball-alle"))     # [4](http://www.90minut.pl/liga/1/liga14072.html)
-    urls.append((f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/", False, "weltfussball-spielplan"))  # [5](https://www.footballcritic.com/ekstraklasa/season-2024-2025/43/72876)
-
-    # reader dla powyższych (ostatnia deska ratunku)
+    # worldfootball/weltfussball
+    urls.append((f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/", False, "worldfootball-all"))   # [3](https://www.meczyki.pl/liga/ekstraklasa/119/terminarz)
+    urls.append((f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/", False, "worldfootball-schedule")) # [4](https://www.wyniki.pl/pko-bp-ekstraklasa/mecze/)
+    urls.append((f"https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-{season}/", False, "weltfussball-alle"))     # [5](http://www.90minut.pl/liga/1/liga14072.html)
+    urls.append((f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/", False, "weltfussball-spielplan"))  # [6](https://www.footballcritic.com/ekstraklasa/season-2024-2025/43/72876)
+    # reader dla powyższych
     base = "https://r.jina.ai/http://"
     for u, _, tag in list(urls):
         if "r.jina.ai" in u:
@@ -102,9 +170,7 @@ def candidate_urls_for_season(season: str) -> list[tuple[str, bool, str]]:
         urls.append((base + u.replace("https://", "").replace("http://", ""), True, f"{tag}-reader"))
     return urls
 
-# --- Parsery -----------------------------------------------------------------
 def parse_matches_from_html_table(soup: BeautifulSoup) -> list[dict]:
-    """Parser dla worldfootball/weltfussball (tabele 'standard_tabelle')."""
     matches: list[dict] = []
     for table in soup.select("table.standard_tabelle"):
         for tr in table.select("tr"):
@@ -116,10 +182,11 @@ def parse_matches_from_html_table(soup: BeautifulSoup) -> list[dict]:
             home  = tds[2].get_text(" ", strip=True)
             score = tds[3].get_text(" ", strip=True)
             away  = tds[4].get_text(" ", strip=True)
-            if not re.search(r"\d+\s*[:–-]\s*\d+", score):
+            m = re.search(r"(\d+)\s*[:–-]\s*(\d+)", score)
+            if not m:
                 continue
             dt = parse_datetime(d_str, t_str) or datetime(1900,1,1)
-            hg, ag = [int(x.strip()) for x in re.split(r"[:–-]", re.search(r"(\d+\s*[:–-]\s*\d+)", score).group(1))]
+            hg, ag = int(m.group(1)), int(m.group(2))
             matches.append({
                 "dt": dt.isoformat(),
                 "date": d_str, "time": t_str,
@@ -129,80 +196,30 @@ def parse_matches_from_html_table(soup: BeautifulSoup) -> list[dict]:
     matches.sort(key=lambda m: m["dt"])
     return matches
 
-def parse_matches_from_90minut_html(soup: BeautifulSoup) -> list[dict]:
-    """
-    Parser dla 90minut.pl – działa na CAŁYM tekście strony (nie tylko wierszach),
-    szuka ogólnie: 'TeamA - TeamB 2:1' lub 'TeamA 2-1 TeamB' (niezależnie od otoczenia).
-    """
-    text = soup.get_text("\n", strip=True)
-    return parse_matches_from_text(text)
-
 def parse_matches_from_text(content: str) -> list[dict]:
-    """
-    Tekstowy parser: wyszukuje wszystkie wystąpienia pary nazw + wyniku, także wewnątrz dłuższych linii.
-    Dwa uniwersalne wzorce:
-      1) TeamA - TeamB 2:1
-      2) TeamA 2-1 TeamB
-    """
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
     matches: list[dict] = []
-
-    # Wzorzec 1: TeamA - TeamB 2:1
-    rx_hyphen = re.compile(
-        r"(?P<home>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)\s[-–]\s"
-        r"(?P<away>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)\s"
-        r"(?P<h>\d{1,2})\s*[:–-]\s*(?P<a>\d{1,2})"
-    )
-
-    # Wzorzec 2: TeamA 2:1 TeamB
-    rx_inline = re.compile(
-        r"(?P<home>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)\s"
-        r"(?P<h>\d{1,2})\s*[:–-]\s*(?P<a>\d{1,2})\s"
-        r"(?P<away>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)"
-    )
-
-    # Zmieniamy wielokrotne białe znaki na spacje, żeby ułatwić dopasowanie
-    text = re.sub(r"[ \t]+", " ", content)
-    # Szukamy obu wzorców w całym tekście
-    found = []
-
-    for m in rx_hyphen.finditer(text):
-        home = m.group("home").strip()
-        away = m.group("away").strip()
-        hg = int(m.group("h")); ag = int(m.group("a"))
-        # Filtr minimalny długości nazw
-        if len(home) < 3 or len(away) < 3:
+    rx_hyphen = re.compile(r"(.{3,60}?)\s[-–]\s(.{3,60}?)\s(\d{1,2})\s*[:–-]\s*(\d{1,2})")
+    rx_inline = re.compile(r"(.{3,60}?)\s(\d{1,2})\s*[:–-]\s*(\d{1,2})\s(.{3,60})")
+    for ln in lines:
+        m = rx_hyphen.search(ln) or rx_inline.search(ln)
+        if not m:
             continue
-        found.append((home, away, hg, ag))
-
-    for m in rx_inline.finditer(text):
-        home = m.group("home").strip()
-        away = m.group("away").strip()
-        hg = int(m.group("h")); ag = int(m.group("a"))
-        if len(home) < 3 or len(away) < 3:
-            continue
-        found.append((home, away, hg, ag))
-
-    # Usuwamy ew. duplikaty zachowując kolejność
-    seen = set()
-    for home, away, hg, ag in found:
-        key = (home, away, hg, ag)
-        if key in seen:
-            continue
-        seen.add(key)
+        if m.re is rx_hyphen:
+            home, away, hg, ag = m.group(1).strip(), m.group(2).strip(), int(m.group(3)), int(m.group(4))
+        else:
+            home, hg, ag, away = m.group(1).strip(), int(m.group(2)), int(m.group(3)), m.group(4).strip()
         matches.append({
-            "dt": datetime(1900,1,1).isoformat(),  # porządek wystąpień
+            "dt": datetime(1900,1,1).isoformat(),
             "date": "", "time": "",
             "home": home, "away": away,
             "home_goals": hg, "away_goals": ag,
         })
-
     return matches
 
-# --- Główna funkcja pobierania ----------------------------------------------
-def fetch_all_matches():
+def fetch_all_matches_via_scrape() -> tuple[list[dict], str]:
     season = season_slug()
     urls = candidate_urls_for_season(season)
-
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
 
@@ -212,29 +229,26 @@ def fetch_all_matches():
             print(f"[INFO] Próba pobrania ({tag}): {url}")
             r = http_get_with_retry(session, url)
             content = r.text
-
-            if "90minut" in tag and not reader_mode:
-                soup = BeautifulSoup(content, "html.parser")
-                matches = parse_matches_from_90minut_html(soup)
-            elif reader_mode:
+            if reader_mode:
                 matches = parse_matches_from_text(content)
             else:
                 soup = BeautifulSoup(content, "html.parser")
-                matches = parse_matches_from_html_table(soup)
-
+                if "90minut" in tag:
+                    # 90minut – parsuj tekst całości
+                    matches = parse_matches_from_text(soup.get_text("\n", strip=True))
+                else:
+                    matches = parse_matches_from_html_table(soup)
             if matches:
                 print(f"[OK] Udało się pobrać mecze z: {url}. Liczba meczów: {len(matches)}")
                 return matches, url
-
             print(f"[WARN] Parser nie znalazł meczów na: {url} – próbuję kolejny.")
         except Exception as e:
             last_error = e
             print(f"[WARN] Błąd przy {url}: {e} – próbuję kolejny.")
             continue
-
     if last_error:
         raise last_error
-    raise RuntimeError("Nie udało się pobrać danych meczowych (pusto po wszystkich źródłach).")
+    raise RuntimeError("Nie udało się pobrać danych (scrape).")
 
 # --- Logika serii ------------------------------------------------------------
 def current_no_draw_streak(matches: list[dict]) -> tuple[int, dict | None]:
@@ -279,7 +293,28 @@ def send_telegram(text: str) -> None:
 
 # --- Main --------------------------------------------------------------------
 def main() -> None:
-    matches, source_url = fetch_all_matches()
+    matches = []
+    source_url = ""
+    # 1) Najpierw API-FOOTBALL (jeśli mamy klucz)
+    if API_FOOTBALL_KEY:
+        try:
+            s_api = api_session()
+            league_id = api_get_league_id_poland_ekstraklasa(s_api)  # /leagues …  [1](https://www.api-football.com/documentation-v3)
+            season_year = season_start_year()
+            print(f"[INFO] API: Ekstraklasa league_id={league_id}, season={season_year}")
+            matches = api_fetch_all_fixtures(s_api, league_id, season_year)       # /fixtures …  [1](https://www.api-football.com/documentation-v3)
+            source_url = f"API-FOOTBALL/v3 fixtures league={league_id} season={season_year}"
+        except Exception as e:
+            print(f"[WARN] API‑FOOTBALL nie zadziałało: {e}. Przechodzę na fallback scrape.")
+            matches = []
+            source_url = ""
+
+    # 2) Fallback: scrape (gdy API się nie udało)
+    if not matches:
+        m2, src = fetch_all_matches_via_scrape()
+        matches, source_url = m2, src
+
+    # 3) Seria + alert
     streak, last = current_no_draw_streak(matches)
     print(f"Aktualna seria bez remisów w Ekstraklasie: {streak}")
 
