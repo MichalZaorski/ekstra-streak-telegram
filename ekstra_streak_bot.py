@@ -22,9 +22,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 # --- 90minut.pl: ID strony sezonu (2025/2026) --------------------------------
-# 90minut publikuje sezon Ekstraklasy 2025/26 pod: http://www.90minut.pl/liga/1/liga14072.html
-# (jeśli w przyszłości zmieni się sezon, zmieni się też numer 'ligaXXXXX')
-LIGA90_ID = os.getenv("LIGA90_ID", "14072")  # możesz nadpisać z sekretem, gdy zacznie się nowy sezon
+# Sezon 2025/26: http://www.90minut.pl/liga/1/liga14072.html  (możesz nadpisać przez sekret LIGA90_ID)
+LIGA90_ID = os.getenv("LIGA90_ID", "14072")  # zaktualizujesz, gdy zacznie się nowy sezon
 
 # --- Nagłówki HTTP jak w przeglądarce (mniej 403) ----------------------------
 BROWSER_HEADERS = {
@@ -43,13 +42,11 @@ BROWSER_HEADERS = {
 
 # --- Pomocnicze --------------------------------------------------------------
 def season_slug(today: date | None = None) -> str:
-    """Zwraca slug sezonu 'YYYY-YYYY' (np. 2025-2026)."""
     today = today or date.today()
     start = today.year if today.month >= 7 else today.year - 1
     return f"{start}-{start+1}"
 
 def parse_datetime(d_str: str, t_str: str | None) -> datetime | None:
-    """Próbuje sparsować datę/czas w kilku formatach."""
     t_str = t_str or ""
     candidates = [
         (f"{d_str} {t_str}", "%d/%m/%Y %H:%M"),
@@ -66,9 +63,6 @@ def parse_datetime(d_str: str, t_str: str | None) -> datetime | None:
 
 # --- Pobieranie z retry ------------------------------------------------------
 def http_get_with_retry(session: requests.Session, url: str, max_tries: int = 5, backoff: float = 2.0) -> requests.Response:
-    """
-    GET z prostym retry na 403/429 i chwilowe błędy sieciowe.
-    """
     last_exc: Exception | None = None
     for i in range(max_tries):
         try:
@@ -88,37 +82,29 @@ def http_get_with_retry(session: requests.Session, url: str, max_tries: int = 5,
 
 # --- Źródła danych (kolejność prób) ------------------------------------------
 def candidate_urls_for_season(season: str) -> list[tuple[str, bool, str]]:
-    """
-    Zwraca listę (url, reader_mode, source_tag). Jeśli reader_mode=True, traktujemy
-    odpowiedź jako tekst (przez „reader”), a nie klasyczne tabele HTML.
-    """
     urls: list[tuple[str, bool, str]] = []
-
-    # 1) 90minut.pl – oficjalna strona sezonu (2025/26) i jej reader
+    # 1) 90minut.pl – strona sezonu 2025/26
     u90 = f"http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html"  # PKO BP Ekstraklasa 2025/2026
-    urls.append((u90, False, "90minut"))                                   # [1](http://www.90minut.pl/liga/1/liga14072.html)
+    urls.append((u90, False, "90minut"))                                    # [1](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
     urls.append((f"https://r.jina.ai/http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html", True, "90minut-reader"))
 
-    # 2) worldfootball / weltfussball – fallbacki
-    urls.append((f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/", False, "worldfootball-all"))  # [2](https://www.worldfootball.net/all_matches/pol-ekstraklasa-2025-2026/)
-    urls.append((f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/", False, "worldfootball-schedule")) # [3](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
+    # 2) worldfootball/weltfussball – fallbacki
+    urls.append((f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/", False, "worldfootball-all"))  # [2](https://www.meczyki.pl/liga/ekstraklasa/119/terminarz)
+    urls.append((f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/", False, "worldfootball-schedule")) # [3](https://www.wyniki.pl/pko-bp-ekstraklasa/mecze/)
     urls.append((f"https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-{season}/", False, "weltfussball-alle"))     # [4](http://www.90minut.pl/liga/1/liga14072.html)
-    urls.append((f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/", False, "weltfussball-spielplan"))  # [5](https://www.weltfussball.de/wettbewerb/pol-ekstraklasa/)
+    urls.append((f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/", False, "weltfussball-spielplan"))  # [5](https://www.footballcritic.com/ekstraklasa/season-2024-2025/43/72876)
 
-    # reader dla powyższych
+    # reader dla powyższych (ostatnia deska ratunku)
     base = "https://r.jina.ai/http://"
     for u, _, tag in list(urls):
         if "r.jina.ai" in u:
             continue
         urls.append((base + u.replace("https://", "").replace("http://", ""), True, f"{tag}-reader"))
-
     return urls
 
 # --- Parsery -----------------------------------------------------------------
 def parse_matches_from_html_table(soup: BeautifulSoup) -> list[dict]:
-    """
-    Parser dla stron z tabelami 'standard_tabelle' (worldfootball/weltfussball).
-    """
+    """Parser dla worldfootball/weltfussball (tabele 'standard_tabelle')."""
     matches: list[dict] = []
     for table in soup.select("table.standard_tabelle"):
         for tr in table.select("tr"):
@@ -130,79 +116,90 @@ def parse_matches_from_html_table(soup: BeautifulSoup) -> list[dict]:
             home  = tds[2].get_text(" ", strip=True)
             score = tds[3].get_text(" ", strip=True)
             away  = tds[4].get_text(" ", strip=True)
-            if not re.match(r"^\d+\s*[:–-]\s*\d+$", score):
+            if not re.search(r"\d+\s*[:–-]\s*\d+", score):
                 continue
             dt = parse_datetime(d_str, t_str) or datetime(1900,1,1)
-            hg, ag = [int(x.strip()) for x in re.split(r"[:–-]", score)]
+            hg, ag = [int(x.strip()) for x in re.split(r"[:–-]", re.search(r"(\d+\s*[:–-]\s*\d+)", score).group(1))]
             matches.append({
                 "dt": dt.isoformat(),
-                "date": d_str,
-                "time": t_str,
-                "home": home,
-                "away": away,
-                "home_goals": hg,
-                "away_goals": ag,
+                "date": d_str, "time": t_str,
+                "home": home, "away": away,
+                "home_goals": hg, "away_goals": ag,
             })
     matches.sort(key=lambda m: m["dt"])
     return matches
 
-def parse_matches_text_generic(lines: list[str]) -> list[dict]:
-    """
-    Parser tekstowy typu: TeamA 2-1 TeamB (kolejność wystąpienia = kolejność chronologiczna,
-    co do liczenia serii wystarczy).
-    """
-    matches: list[dict] = []
-    # Dopuszczamy: "… TeamA 2-1 TeamB" lub "TeamA - TeamB 2:1"
-    rx1 = re.compile(r"^(.{2,60}?)\s+(\d{1,2})\s*[:–-]\s*(\d{1,2})\s+(.{2,60})$")
-    rx2 = re.compile(r"^(.{2,60}?)\s[-–]\s(.{2,60}?)\s+(\d{1,2})\s*[:–-]\s*(\d{1,2})(?:\s|$)")
-    for ln in lines:
-        ln = ln.strip()
-        if not ln or ln.lower().startswith(("Tabela", "Ostatnia kolejka".lower())):
-            continue
-        m = rx1.match(ln)
-        if m:
-            home, hg, ag, away = m.group(1).strip(), int(m.group(2)), int(m.group(3)), m.group(4).strip()
-        else:
-            m = rx2.match(ln)
-            if not m:
-                continue
-            home, away, hg, ag = m.group(1).strip(), m.group(2).strip(), int(m.group(3)), int(m.group(4))
-        # Filtr: pomiń bardzo krótkie „nazwy”
-        if len(home) < 3 or len(away) < 3:
-            continue
-        matches.append({
-            "dt": datetime(1900,1,1).isoformat(),
-            "date": "",
-            "time": "",
-            "home": home,
-            "away": away,
-            "home_goals": hg,
-            "away_goals": ag,
-        })
-    return matches
-
 def parse_matches_from_90minut_html(soup: BeautifulSoup) -> list[dict]:
     """
-    Parser dla 90minut.pl (HTML) – strona sezonu zawiera sekcje kolejek z meczami.
-    Użyjemy dość elastycznego dopasowania tekstowego.
+    Parser dla 90minut.pl – działa na CAŁYM tekście strony (nie tylko wierszach),
+    szuka ogólnie: 'TeamA - TeamB 2:1' lub 'TeamA 2-1 TeamB' (niezależnie od otoczenia).
     """
-    # Wyciągamy wszystkie wiersze tekstu z sekcji głównej
-    text_chunks = [el.get_text(" ", strip=True) for el in soup.select("body")]
-    text = "\n".join(text_chunks)
-    lines = [ln for ln in (x.strip() for x in text.splitlines()) if ln]
-    return parse_matches_text_generic(lines)
+    text = soup.get_text("\n", strip=True)
+    return parse_matches_from_text(text)
 
 def parse_matches_from_text(content: str) -> list[dict]:
-    """Parser fallback dla trybu reader (tekst)."""
-    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
-    return parse_matches_text_generic(lines)
+    """
+    Tekstowy parser: wyszukuje wszystkie wystąpienia pary nazw + wyniku, także wewnątrz dłuższych linii.
+    Dwa uniwersalne wzorce:
+      1) TeamA - TeamB 2:1
+      2) TeamA 2-1 TeamB
+    """
+    matches: list[dict] = []
+
+    # Wzorzec 1: TeamA - TeamB 2:1
+    rx_hyphen = re.compile(
+        r"(?P<home>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)\s[-–]\s"
+        r"(?P<away>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)\s"
+        r"(?P<h>\d{1,2})\s*[:–-]\s*(?P<a>\d{1,2})"
+    )
+
+    # Wzorzec 2: TeamA 2:1 TeamB
+    rx_inline = re.compile(
+        r"(?P<home>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)\s"
+        r"(?P<h>\d{1,2})\s*[:–-]\s*(?P<a>\d{1,2})\s"
+        r"(?P<away>[A-ZĄĆĘŁŃÓŚŹŻ0-9][^\d\n]{1,60}?)"
+    )
+
+    # Zmieniamy wielokrotne białe znaki na spacje, żeby ułatwić dopasowanie
+    text = re.sub(r"[ \t]+", " ", content)
+    # Szukamy obu wzorców w całym tekście
+    found = []
+
+    for m in rx_hyphen.finditer(text):
+        home = m.group("home").strip()
+        away = m.group("away").strip()
+        hg = int(m.group("h")); ag = int(m.group("a"))
+        # Filtr minimalny długości nazw
+        if len(home) < 3 or len(away) < 3:
+            continue
+        found.append((home, away, hg, ag))
+
+    for m in rx_inline.finditer(text):
+        home = m.group("home").strip()
+        away = m.group("away").strip()
+        hg = int(m.group("h")); ag = int(m.group("a"))
+        if len(home) < 3 or len(away) < 3:
+            continue
+        found.append((home, away, hg, ag))
+
+    # Usuwamy ew. duplikaty zachowując kolejność
+    seen = set()
+    for home, away, hg, ag in found:
+        key = (home, away, hg, ag)
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append({
+            "dt": datetime(1900,1,1).isoformat(),  # porządek wystąpień
+            "date": "", "time": "",
+            "home": home, "away": away,
+            "home_goals": hg, "away_goals": ag,
+        })
+
+    return matches
 
 # --- Główna funkcja pobierania ----------------------------------------------
 def fetch_all_matches():
-    """
-    Najpierw 90minut (normal + reader), potem worldfootball/weltfussball (+ reader).
-    Zwraca: (lista_meczów, url_źródłowy)
-    """
     season = season_slug()
     urls = candidate_urls_for_season(season)
 
@@ -217,13 +214,11 @@ def fetch_all_matches():
             content = r.text
 
             if "90minut" in tag and not reader_mode:
-                # Spróbuj najpierw parsera HTML specyficznego dla 90minut
                 soup = BeautifulSoup(content, "html.parser")
                 matches = parse_matches_from_90minut_html(soup)
             elif reader_mode:
                 matches = parse_matches_from_text(content)
             else:
-                # worldfootball/weltfussball HTML
                 soup = BeautifulSoup(content, "html.parser")
                 matches = parse_matches_from_html_table(soup)
 
@@ -243,10 +238,6 @@ def fetch_all_matches():
 
 # --- Logika serii ------------------------------------------------------------
 def current_no_draw_streak(matches: list[dict]) -> tuple[int, dict | None]:
-    """
-    Zwraca (długość_serii_bez_remisów, ostatni_mecz_w_serii).
-    Seria resetuje się przy każdym remisie.
-    """
     streak = 0
     last: dict | None = None
     for m in matches:
@@ -299,10 +290,8 @@ def main() -> None:
     should_notify = False
     if last and streak >= THRESHOLD:
         if ALERT_MODE == "EACH":
-            # powiadom po KAŻDYM kolejnym meczu wydłużającym serię
             should_notify = (last.get("dt") != last_notified_dt)
         elif ALERT_MODE == "THRESHOLD_ONLY":
-            # tylko przy przekroczeniu progu po raz pierwszy
             should_notify = (last_len < THRESHOLD)
         else:
             should_notify = (last.get("dt") != last_notified_dt)
@@ -320,7 +309,6 @@ def main() -> None:
         state["last_streak_len"] = streak
         save_state(state)
     else:
-        # Aktualizuj stan informacyjnie, nawet jeśli nie wysyłamy alertu
         state["last_seen_dt"] = last["dt"] if last else None
         state["last_seen_streak"] = streak
         state["last_streak_len"] = streak
