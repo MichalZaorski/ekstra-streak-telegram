@@ -21,7 +21,12 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
-# --- Nagłówki HTTP jak w prawdziwej przeglądarce (mniej 403) -----------------
+# --- 90minut.pl: ID strony sezonu (2025/2026) --------------------------------
+# 90minut publikuje sezon Ekstraklasy 2025/26 pod: http://www.90minut.pl/liga/1/liga14072.html
+# (jeśli w przyszłości zmieni się sezon, zmieni się też numer 'ligaXXXXX')
+LIGA90_ID = os.getenv("LIGA90_ID", "14072")  # możesz nadpisać z sekretem, gdy zacznie się nowy sezon
+
+# --- Nagłówki HTTP jak w przeglądarce (mniej 403) ----------------------------
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -33,7 +38,6 @@ BROWSER_HEADERS = {
         "image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.worldfootball.net/",
     "Connection": "keep-alive",
 }
 
@@ -82,34 +86,38 @@ def http_get_with_retry(session: requests.Session, url: str, max_tries: int = 5,
         raise last_exc
     raise RuntimeError(f"Nieudane pobranie: {url}")
 
-# --- Kandydaci URL (również „readerowe”, które obchodzą filtry) --------------
-def candidate_urls_for_season(season: str) -> list[tuple[str, bool]]:
+# --- Źródła danych (kolejność prób) ------------------------------------------
+def candidate_urls_for_season(season: str) -> list[tuple[str, bool, str]]:
     """
-    Zwraca listę (url, reader_mode). Jeśli reader_mode=True, traktujemy odpowiedź
-    bardziej tekstowo (bez klasycznych tabel), ale dalej wykryjemy wyniki.
+    Zwraca listę (url, reader_mode, source_tag). Jeśli reader_mode=True, traktujemy
+    odpowiedź jako tekst (przez „reader”), a nie klasyczne tabele HTML.
     """
-    urls: list[tuple[str, bool]] = []
+    urls: list[tuple[str, bool, str]] = []
 
-    # 1) worldfootball.net – „all matches” (pełny przegląd sezonu)
-    urls.append((f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/", False))  # [1](https://www.worldfootball.net/all_matches/pol-ekstraklasa-2025-2026/)
-    # 2) worldfootball.net – „schedule”
-    urls.append((f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/", False))      # [2](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
-    # 3) weltfussball.de – „alle_spiele”
-    urls.append((f"https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-{season}/", False))     # [3](https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-2025-2026/)
-    # 4) weltfussball.de – „spielplan”
-    urls.append((f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/", False))       # [4](https://www.weltfussball.de/spielplan/pol-ekstraklasa-2025-2026/)
+    # 1) 90minut.pl – oficjalna strona sezonu (2025/26) i jej reader
+    u90 = f"http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html"  # PKO BP Ekstraklasa 2025/2026
+    urls.append((u90, False, "90minut"))                                   # [1](http://www.90minut.pl/liga/1/liga14072.html)
+    urls.append((f"https://r.jina.ai/http://www.90minut.pl/liga/1/liga{LIGA90_ID}.html", True, "90minut-reader"))
 
-    # Fallback: „reader” (statyczna wersja tych samych stron – mniej blokad)
+    # 2) worldfootball / weltfussball – fallbacki
+    urls.append((f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/", False, "worldfootball-all"))  # [2](https://www.worldfootball.net/all_matches/pol-ekstraklasa-2025-2026/)
+    urls.append((f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/", False, "worldfootball-schedule")) # [3](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
+    urls.append((f"https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-{season}/", False, "weltfussball-alle"))     # [4](http://www.90minut.pl/liga/1/liga14072.html)
+    urls.append((f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/", False, "weltfussball-spielplan"))  # [5](https://www.weltfussball.de/wettbewerb/pol-ekstraklasa/)
+
+    # reader dla powyższych
     base = "https://r.jina.ai/http://"
-    for u, _ in list(urls):
-        urls.append((base + u.replace("https://", "").replace("http://", ""), True))
+    for u, _, tag in list(urls):
+        if "r.jina.ai" in u:
+            continue
+        urls.append((base + u.replace("https://", "").replace("http://", ""), True, f"{tag}-reader"))
+
     return urls
 
-# --- Parser wyników ----------------------------------------------------------
-def parse_matches_from_html(soup: BeautifulSoup) -> list[dict]:
+# --- Parsery -----------------------------------------------------------------
+def parse_matches_from_html_table(soup: BeautifulSoup) -> list[dict]:
     """
-    Parser dla klasycznych stron (HTML z tabelami).
-    Szukamy tabel 'standard_tabelle' i wierszy z kolumnami: data | godz | dom | wynik | wyjazd.
+    Parser dla stron z tabelami 'standard_tabelle' (worldfootball/weltfussball).
     """
     matches: list[dict] = []
     for table in soup.select("table.standard_tabelle"):
@@ -122,13 +130,9 @@ def parse_matches_from_html(soup: BeautifulSoup) -> list[dict]:
             home  = tds[2].get_text(" ", strip=True)
             score = tds[3].get_text(" ", strip=True)
             away  = tds[4].get_text(" ", strip=True)
-
             if not re.match(r"^\d+\s*[:–-]\s*\d+$", score):
                 continue
-            dt = parse_datetime(d_str, t_str)
-            if not dt:
-                # jeżeli brak daty – przyjmiemy porządek wystąpienia
-                dt = datetime(1900,1,1)  # placeholder
+            dt = parse_datetime(d_str, t_str) or datetime(1900,1,1)
             hg, ag = [int(x.strip()) for x in re.split(r"[:–-]", score)]
             matches.append({
                 "dt": dt.isoformat(),
@@ -139,31 +143,35 @@ def parse_matches_from_html(soup: BeautifulSoup) -> list[dict]:
                 "home_goals": hg,
                 "away_goals": ag,
             })
-    # sort – placeholdery wylądują na początku, ale ważny jest sam ciąg
     matches.sort(key=lambda m: m["dt"])
     return matches
 
-def parse_matches_from_text(text: str) -> list[dict]:
+def parse_matches_text_generic(lines: list[str]) -> list[dict]:
     """
-    Parser fallback dla trybu 'reader' (treść bardziej tekstowa).
-    Szukamy linii z układem: NAZWA - NAZWA X:Y   (team names + wynik).
-    Daty/godziny nie są kluczowe do liczenia serii, więc traktujemy kolejność wystąpienia.
+    Parser tekstowy typu: TeamA 2-1 TeamB (kolejność wystąpienia = kolejność chronologiczna,
+    co do liczenia serii wystarczy).
     """
     matches: list[dict] = []
-    # Zbij podwójne spacje i split po liniach
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    # Wzorzec: TeamA - TeamB 2:1  (czasem separator jest "–" lub " - ")
-    rx = re.compile(r"^(.{2,60}?)\s[-–]\s(.{2,60}?)\s(\d{1,2})\s*[:–-]\s*(\d{1,2})(?:\s|$)")
+    # Dopuszczamy: "… TeamA 2-1 TeamB" lub "TeamA - TeamB 2:1"
+    rx1 = re.compile(r"^(.{2,60}?)\s+(\d{1,2})\s*[:–-]\s*(\d{1,2})\s+(.{2,60})$")
+    rx2 = re.compile(r"^(.{2,60}?)\s[-–]\s(.{2,60}?)\s+(\d{1,2})\s*[:–-]\s*(\d{1,2})(?:\s|$)")
     for ln in lines:
-        m = rx.search(ln)
-        if not m:
+        ln = ln.strip()
+        if not ln or ln.lower().startswith(("Tabela", "Ostatnia kolejka".lower())):
             continue
-        home = m.group(1).strip()
-        away = m.group(2).strip()
-        hg   = int(m.group(3))
-        ag   = int(m.group(4))
+        m = rx1.match(ln)
+        if m:
+            home, hg, ag, away = m.group(1).strip(), int(m.group(2)), int(m.group(3)), m.group(4).strip()
+        else:
+            m = rx2.match(ln)
+            if not m:
+                continue
+            home, away, hg, ag = m.group(1).strip(), m.group(2).strip(), int(m.group(3)), int(m.group(4))
+        # Filtr: pomiń bardzo krótkie „nazwy”
+        if len(home) < 3 or len(away) < 3:
+            continue
         matches.append({
-            "dt": datetime(1900,1,1).isoformat(),  # kolejność pojawienia się
+            "dt": datetime(1900,1,1).isoformat(),
             "date": "",
             "time": "",
             "home": home,
@@ -173,11 +181,26 @@ def parse_matches_from_text(text: str) -> list[dict]:
         })
     return matches
 
+def parse_matches_from_90minut_html(soup: BeautifulSoup) -> list[dict]:
+    """
+    Parser dla 90minut.pl (HTML) – strona sezonu zawiera sekcje kolejek z meczami.
+    Użyjemy dość elastycznego dopasowania tekstowego.
+    """
+    # Wyciągamy wszystkie wiersze tekstu z sekcji głównej
+    text_chunks = [el.get_text(" ", strip=True) for el in soup.select("body")]
+    text = "\n".join(text_chunks)
+    lines = [ln for ln in (x.strip() for x in text.splitlines()) if ln]
+    return parse_matches_text_generic(lines)
+
+def parse_matches_from_text(content: str) -> list[dict]:
+    """Parser fallback dla trybu reader (tekst)."""
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    return parse_matches_text_generic(lines)
+
 # --- Główna funkcja pobierania ----------------------------------------------
 def fetch_all_matches():
     """
-    Pobiera rozegrane mecze bieżącego sezonu Ekstraklasy z jednego z kilku
-    alternatywnych źródeł (worldfootball / weltfussball), a w razie blokady – przez reader.
+    Najpierw 90minut (normal + reader), potem worldfootball/weltfussball (+ reader).
     Zwraca: (lista_meczów, url_źródłowy)
     """
     season = season_slug()
@@ -187,18 +210,22 @@ def fetch_all_matches():
     session.headers.update(BROWSER_HEADERS)
 
     last_error: Exception | None = None
-    for url, reader_mode in urls:
+    for url, reader_mode, tag in urls:
         try:
-            print(f"[INFO] Próba pobrania: {url}")
+            print(f"[INFO] Próba pobrania ({tag}): {url}")
             r = http_get_with_retry(session, url)
             content = r.text
 
-            if reader_mode:
-                # tryb reader – parsujemy głównie tekst
+            if "90minut" in tag and not reader_mode:
+                # Spróbuj najpierw parsera HTML specyficznego dla 90minut
+                soup = BeautifulSoup(content, "html.parser")
+                matches = parse_matches_from_90minut_html(soup)
+            elif reader_mode:
                 matches = parse_matches_from_text(content)
             else:
+                # worldfootball/weltfussball HTML
                 soup = BeautifulSoup(content, "html.parser")
-                matches = parse_matches_from_html(soup)
+                matches = parse_matches_from_html_table(soup)
 
             if matches:
                 print(f"[OK] Udało się pobrać mecze z: {url}. Liczba meczów: {len(matches)}")
