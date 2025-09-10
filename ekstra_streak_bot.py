@@ -2,12 +2,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, json, sys, time
+import os
+import re
+import json
+import sys
+import time
 from datetime import datetime, date
+
 import requests
 from bs4 import BeautifulSoup
 
-# --- Konfiguracja (z sekretów / env) -----------------------------------------
+# --- Konfiguracja (z sekretów/zmiennych środowiskowych) ----------------------
 THRESHOLD = int(os.getenv("THRESHOLD", "7"))          # domyślnie 7 (>=7)
 STATE_PATH = os.getenv("STATE_PATH", "state.json")
 ALERT_MODE = os.getenv("ALERT_MODE", "EACH").upper()  # EACH | THRESHOLD_ONLY
@@ -16,7 +21,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
-# --- Nagłówki HTTP jak w prawdziwej przeglądarce (zapobiega 403) -------------
+# --- Nagłówki HTTP jak w prawdziwej przeglądarce (mniej 403) -----------------
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -33,14 +38,15 @@ HEADERS = {
 }
 
 # --- Pomocnicze --------------------------------------------------------------
-def season_slug(today=None):
+def season_slug(today: date | None = None) -> str:
     """Zwraca slug sezonu 'YYYY-YYYY' (np. 2025-2026)."""
     today = today or date.today()
     start = today.year if today.month >= 7 else today.year - 1
     return f"{start}-{start+1}"
 
-def parse_datetime(d_str, t_str):
-    """Próbuje sparsować datę i czas w kilku formatach."""
+def parse_datetime(d_str: str, t_str: str | None) -> datetime | None:
+    """Próbuje sparsować datę/czas w kilku formatach."""
+    t_str = t_str or ""
     candidates = [
         (f"{d_str} {t_str}", "%d/%m/%Y %H:%M"),
         (f"{d_str} {t_str}", "%d/%m/%y %H:%M"),
@@ -49,31 +55,28 @@ def parse_datetime(d_str, t_str):
     ]
     for s, fmt in candidates:
         try:
-            return datetime.strptime(s, fmt)
+            return datetime.strptime(s.strip(), fmt)
         except Exception:
-            pass
+            continue
     return None
 
-def http_get_with_retry(url, max_tries=4, backoff=2):
+def http_get_with_retry(url: str, max_tries: int = 4, backoff: float = 2.0) -> requests.Response:
     """
-    GET z prostym retry na 403/429 i innych chwilowych błędach sieciowych.
+    GET z prostym retry na 403/429 i chwilowe błędy sieciowe.
     """
-    last_exc = None
+    last_exc: Exception | None = None
     for i in range(max_tries):
         try:
             r = requests.get(url, timeout=30, headers=HEADERS)
             if r.status_code == 200:
                 return r
             if r.status_code in (403, 429):
-                # krótki backoff i ponów próbę
                 time.sleep(backoff * (i + 1))
                 continue
-            # dla innych kodów – jeśli to nie 200, rzuć wyjątek
             r.raise_for_status()
         except requests.RequestException as e:
             last_exc = e
             time.sleep(backoff * (i + 1))
-    # po wszystkich próbach – rzuć ostatni wyjątek
     if last_exc:
         raise last_exc
     raise RuntimeError(f"Nieudane pobranie: {url}")
@@ -81,8 +84,8 @@ def http_get_with_retry(url, max_tries=4, backoff=2):
 def fetch_all_matches():
     """
     Pobiera rozegrane mecze bieżącego sezonu Ekstraklasy z worldfootball.net:
-    - URL główny: https://www.worldfootball.net/all_matches/pol-ekstraklasa-YYYY-YYYY/
-    - Fallback bez 'www': https://worldfootball.net/all_matches/pol-ekstraklasa-YYYY-YYYY/
+      - https://www.worldfootball.net/all_matches/pol-ekstraklasa-YYYY-YYYY/
+      - fallback: https://worldfootball.net/all_matches/pol-ekstraklasa-YYYY-YYYY/
     Zwraca: (lista_meczów, url_źródłowy)
     """
     season = season_slug()
@@ -91,13 +94,14 @@ def fetch_all_matches():
         f"https://worldfootball.net/all_matches/pol-ekstraklasa-{season}/",
     ]
 
-    last_error = None
+    last_error: Exception | None = None
     for url in urls:
         try:
             r = http_get_with_retry(url)
             soup = BeautifulSoup(r.text, "html.parser")
+            matches: list[dict] = []
 
-            matches = []
+            # Tabele z meczami mają klasę 'standard_tabelle'
             for table in soup.select("table.standard_tabelle"):
                 for tr in table.select("tr"):
                     tds = tr.find_all("td")
@@ -110,7 +114,7 @@ def fetch_all_matches():
                     score = tds[3].get_text(" ", strip=True)
                     away  = tds[4].get_text(" ", strip=True)
 
-                    # tylko rozegrane mecze z wynikiem liczbowym
+                    # tylko rozegrane mecze z wynikiem liczbowym (np. "2:1")
                     if not re.match(r"^\d+\s*:\s*\d+$", score):
                         continue
 
@@ -132,23 +136,21 @@ def fetch_all_matches():
             matches.sort(key=lambda m: m["dt"])  # chronologicznie
             if matches:
                 return matches, url
-            # jeśli pusty parsing – próbuj nast. URL
         except Exception as e:
             last_error = e
             continue
 
-    # Jeśli tu dotarliśmy – żadna próba nie zadziałała
     if last_error:
         raise last_error
     raise RuntimeError("Nie udało się pobrać danych meczowych (puste).")
 
-def current_no_draw_streak(matches):
+def current_no_draw_streak(matches: list[dict]) -> tuple[int, dict | None]:
     """
     Zwraca (długość_serii_bez_remisów, ostatni_mecz_w_serii).
     Seria resetuje się przy każdym remisie.
     """
     streak = 0
-    last = None
+    last: dict | None = None
     for m in matches:
         if m["home_goals"] == m["away_goals"]:
             streak = 0
@@ -158,18 +160,18 @@ def current_no_draw_streak(matches):
             last = m
     return streak, last
 
-def load_state():
+def load_state() -> dict:
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-def save_state(state):
+def save_state(state: dict) -> None:
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def send_telegram(text):
+def send_telegram(text: str) -> None:
     if DRY_RUN:
         print("[DRY_RUN] Telegram message would be:\n", text)
         return
@@ -185,7 +187,7 @@ def send_telegram(text):
     }, timeout=30)
     resp.raise_for_status()
 
-def main():
+def main() -> None:
     matches, source_url = fetch_all_matches()
     streak, last = current_no_draw_streak(matches)
     print(f"Aktualna seria bez remisów w Ekstraklasie: {streak}")
@@ -208,8 +210,21 @@ def main():
     if should_notify and last:
         text = (
             f"🔥 <b>Ekstraklasa</b>: seria <b>{streak}</b> meczów z rzędu bez remisu!\n"
-            f"Ostatni: <b>{last['home']}</b> {last['home_goals']}–{last['away_goals']} <b>{last['away']}</b> "
-            f"({last['date']} {last['time']}).\n"
+            f"Ostatni: <b>{last['home']}</b> {last['home_goals']}–{last['away_goals']} "
+            f"<b>{last['away']}</b> ({last['date']} {last['time']}).\n"
             f"Próg: ≥ {THRESHOLD}. Tryb: {ALERT_MODE}.\n"
-           
+            f"Źródło: {source_url}"
+        )
+        send_telegram(text)
+        state["last_notified_dt"] = last["dt"]
+        state["last_streak_len"] = streak
+        save_state(state)
+    else:
+        # Aktualizuj stan informacyjnie, nawet jeśli nie wysyłamy alertu
+        state["last_seen_dt"] = last["dt"] if last else None
+        state["last_seen_streak"] = streak
+        state["last_streak_len"] = streak
+        save_state(state)
 
+if __name__ == "__main__":
+    main()
