@@ -22,7 +22,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 # --- Nagłówki HTTP jak w prawdziwej przeglądarce (mniej 403) -----------------
-HEADERS = {
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -60,17 +60,18 @@ def parse_datetime(d_str: str, t_str: str | None) -> datetime | None:
             continue
     return None
 
-def http_get_with_retry(url: str, max_tries: int = 4, backoff: float = 2.0) -> requests.Response:
+def http_get_with_retry(session: requests.Session, url: str, max_tries: int = 5, backoff: float = 2.0) -> requests.Response:
     """
     GET z prostym retry na 403/429 i chwilowe błędy sieciowe.
     """
     last_exc: Exception | None = None
     for i in range(max_tries):
         try:
-            r = requests.get(url, timeout=30, headers=HEADERS)
+            r = session.get(url, timeout=30)
             if r.status_code == 200:
                 return r
             if r.status_code in (403, 429):
+                # krótki backoff i ponów próbę
                 time.sleep(backoff * (i + 1))
                 continue
             r.raise_for_status()
@@ -81,27 +82,43 @@ def http_get_with_retry(url: str, max_tries: int = 4, backoff: float = 2.0) -> r
         raise last_exc
     raise RuntimeError(f"Nieudane pobranie: {url}")
 
+def candidate_urls_for_season(season: str) -> list[str]:
+    """
+    Zwraca listę alternatywnych URL-i z meczami Ekstraklasy dla danego sezonu.
+    Kolejność ma znaczenie – próbujemy po kolei aż do skutku.
+    """
+    return [
+        # worldfootball.net – wszystkie mecze sezonu
+        f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/",   # [1](https://www.worldfootball.net/all_matches/pol-ekstraklasa-2025-2026/)
+        # worldfootball.net – terminarz (też zawiera wyniki po zakończeniu)
+        f"https://www.worldfootball.net/schedule/pol-ekstraklasa-{season}/",      # [3](https://www.worldfootball.net/schedule/pol-ekstraklasa-2025-2026/)
+        # weltfussball.de – „alle_spiele” (odpowiednik all_matches)
+        f"https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-{season}/",     # [2](https://www.weltfussball.de/alle_spiele/pol-ekstraklasa-2025-2026/)
+        # weltfussball.de – „spielplan” (odpowiednik schedule)
+        f"https://www.weltfussball.de/spielplan/pol-ekstraklasa-{season}/",       # [4](https://www.weltfussball.de/spielplan/pol-ekstraklasa-2025-2026/)
+    ]
+
 def fetch_all_matches():
     """
-    Pobiera rozegrane mecze bieżącego sezonu Ekstraklasy z worldfootball.net:
-      - https://www.worldfootball.net/all_matches/pol-ekstraklasa-YYYY-YYYY/
-      - fallback: https://worldfootball.net/all_matches/pol-ekstraklasa-YYYY-YYYY/
+    Pobiera rozegrane mecze bieżącego sezonu Ekstraklasy z jednego z kilku
+    alternatywnych źródeł (worldfootball / weltfussball).
     Zwraca: (lista_meczów, url_źródłowy)
     """
     season = season_slug()
-    urls = [
-        f"https://www.worldfootball.net/all_matches/pol-ekstraklasa-{season}/",
-        f"https://worldfootball.net/all_matches/pol-ekstraklasa-{season}/",
-    ]
+    urls = candidate_urls_for_season(season)
+
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
 
     last_error: Exception | None = None
     for url in urls:
         try:
-            r = http_get_with_retry(url)
+            print(f"[INFO] Próba pobrania: {url}")
+            r = http_get_with_retry(session, url)
             soup = BeautifulSoup(r.text, "html.parser")
             matches: list[dict] = []
 
-            # Tabele z meczami mają klasę 'standard_tabelle'
+            # Tabele z meczami mają klasę 'standard_tabelle' (w obu domenach)
             for table in soup.select("table.standard_tabelle"):
                 for tr in table.select("tr"):
                     tds = tr.find_all("td")
@@ -117,11 +134,9 @@ def fetch_all_matches():
                     # tylko rozegrane mecze z wynikiem liczbowym (np. "2:1")
                     if not re.match(r"^\d+\s*:\s*\d+$", score):
                         continue
-
                     dt = parse_datetime(d_str, t_str)
                     if not dt:
                         continue
-
                     hg, ag = [int(x.strip()) for x in score.split(":")]
                     matches.append({
                         "dt": dt.isoformat(),
@@ -135,14 +150,18 @@ def fetch_all_matches():
 
             matches.sort(key=lambda m: m["dt"])  # chronologicznie
             if matches:
+                print(f"[OK] Udało się pobrać mecze z: {url}. Liczba meczów: {len(matches)}")
                 return matches, url
+
+            print(f"[WARN] Parser nie znalazł meczów na: {url} – próbuję kolejny.")
         except Exception as e:
             last_error = e
+            print(f"[WARN] Błąd przy {url}: {e} – próbuję kolejny.")
             continue
 
     if last_error:
         raise last_error
-    raise RuntimeError("Nie udało się pobrać danych meczowych (puste).")
+    raise RuntimeError("Nie udało się pobrać danych meczowych (pusto po wszystkich źródłach).")
 
 def current_no_draw_streak(matches: list[dict]) -> tuple[int, dict | None]:
     """
