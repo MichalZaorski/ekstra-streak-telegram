@@ -12,4 +12,4 @@ Domyślnie: N=7, tryb ALERT_MODE=EACH (alert po każdym kolejnym meczu).
 
 ## Uruchomienie
 - Ręcznie: zakładka Actions → Run workflow
-- Automatycznie: cron co 30 min (UTC)
+- Automatycznie: cron co 100 min (UTC)
