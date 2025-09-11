@@ -1,5 +1,6 @@
+
 {
-  "last_notified_dt": "1900-01-01T00:00:00",
+  "last_checked_dt": null,
   "last_streak_len": 0,
-  "last_full_run_ts": 1757573428.7856915
+  "last_notified_dt": null
 }
