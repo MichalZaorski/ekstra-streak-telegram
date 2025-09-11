@@ -373,6 +373,10 @@ def main() -> None:
             base_streak = 0 if (FORCE_REBUILD or not last_checked_dt) else prev_streak
             streak, last = apply_new_matches_to_streak(base_streak, new_matches)
 
+    # Zawsze aktualizuj streak, nawet jeśli new_matches puste
+    state["last_streak_len"] = streak
+    save_state(state)
+
             # sanity guard
             if streak > MAX_REASONABLE_STREAK:
                 print(f"[GUARD] Obcięto alert: obliczona seria {streak} > {MAX_REASONABLE_STREAK}. "
