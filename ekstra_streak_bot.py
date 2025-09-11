@@ -372,8 +372,8 @@ def main() -> None:
             # policz serię
             base_streak = 0 if (FORCE_REBUILD or not last_checked_dt) else prev_streak
             streak, last = apply_new_matches_to_streak(base_streak, new_matches)
-        state["last_streak_len"] = min(streak, MAX_REASONABLE_STREAK)
-        save_state(state)
+            state["last_streak_len"] = min(streak, MAX_REASONABLE_STREAK)
+            save_state(state)
 
             # sanity guard
             if streak > MAX_REASONABLE_STREAK:
